@@ -31,10 +31,10 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 #  НАСТРОЙКИ — заполни перед запуском
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN          = "8757283175:AAEy1joRPQl-QfFJ84QvtgqW1vgXaormSjg"           # токен от @BotFather
-ADMIN_IDS          = [334618540]                # твой Telegram user_id
+BOT_TOKEN          = "YOUR_BOT_TOKEN"           # токен от @BotFather
+ADMIN_IDS          = [123456789]                # твой Telegram user_id
 
-WORKSHOP_DATE_STR  = "01 июня 2025, 12:00"   # дата для показа
+WORKSHOP_DATE_STR  = "ХХ месяца 2025, ХХ:00"   # дата для показа
 WORKSHOP_DATETIME  = datetime(2025, 7, 15, 10, 0)
 WORKSHOP_PRICE     = 10000
 WORKSHOP_LOCATION  = "Ссылка появится за день до воркшопа"
@@ -44,10 +44,10 @@ DB_PATH            = "bot.db"
 
 # Реквизиты ИП
 IP_FIO             = "Пшинник Елена Борисовна"
-IP_INN             = "622601705505"             # ← вставь ИНН
-IP_OGRNIP          = "1027739609391"          # ← вставь ОГРНИП
+IP_INN             = "XXXXXXXXXXXX"             # ← вставь ИНН
+IP_OGRNIP          = "XXXXXXXXXXXXXXX"          # ← вставь ОГРНИП
 IP_EMAIL           = "elena-pshinnik@mail.ru"
-IP_ADDRESS         = "107031, Г. МОСКВА, г Москва, г МОСКВА, УЛ РОЖДЕСТВЕНКА, 10/2, СТР 1"
+IP_ADDRESS         = "УКАЖИ ЮРИДИЧЕСКИЙ АДРЕС ИП"
 
 # ═══════════════════════════════════════════════════════════
 #  СОСТОЯНИЯ
@@ -268,8 +268,23 @@ T_SUCCESS = """
 
 📅 Воркшоп: *{date}*
 
-После проверки оплаты вы получите подтверждение.
+После проверки оплаты вы получите подтверждение и чек.
+
+🔗 *Ссылку на Telegram-канал воркшопа* мы пришлём за день до мероприятия — следите за сообщениями от бота!
+
 _Вопросы — кнопка «💬 Поддержка» в меню._
+""".strip()
+
+T_PAYMENT_CONFIRMED = """
+✅ *Оплата подтверждена!*
+
+Спасибо, {full_name}! Ваше место на воркшопе забронировано 🌸
+
+🔗 *Ссылку на Telegram-канал воркшопа* мы пришлём за день до мероприятия — следите за сообщениями от бота!
+
+📅 Воркшоп: *{date}*
+
+_Если возникнут вопросы — кнопка «💬 Поддержка» в меню._
 """.strip()
 
 T_ADMIN_NEW = """
@@ -399,6 +414,7 @@ def is_admin(uid): return uid in ADMIN_IDS
 def main_kb():
     return ReplyKeyboardMarkup(
         [["📋 Моя регистрация", "💬 Поддержка"],
+         ["💳 Повторить оплату", "✏️ Изменить данные"],
          ["📄 Оферта",          "🔒 Политика данных"]],
         resize_keyboard=True
     )
@@ -658,6 +674,67 @@ async def menu_privacy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
+async def menu_resend_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «💳 Повторить оплату» — отправить QR ещё раз."""
+    rec = db_get(update.effective_user.id)
+    if not rec:
+        await update.message.reply_text(
+            "Вы ещё не зарегистрированы. Нажмите /start чтобы начать.",
+            reply_markup=main_kb()); return
+    if rec["status"] == "Оплачено":
+        await update.message.reply_text(
+            "✅ Ваша оплата уже подтверждена! Ничего делать не нужно.",
+            reply_markup=main_kb()); return
+    kb = [
+        [InlineKeyboardButton("✅ Я оплатила", callback_data="payment_done")],
+        [InlineKeyboardButton("💬 Написать в поддержку", callback_data="go_support")],
+    ]
+    await update.message.reply_text(
+        T_PAYMENT.format(price=WORKSHOP_PRICE),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
+    )
+    try:
+        with open(QR_IMAGE_PATH, "rb") as f:
+            await update.message.reply_photo(
+                photo=f, caption=f"📲 QR-код СБП для оплаты {WORKSHOP_PRICE} ₽"
+            )
+    except FileNotFoundError:
+        await update.message.reply_text("⚠️ QR-код не найден — свяжитесь с организатором.")
+
+async def menu_edit_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопка «✏️ Изменить данные» — ввести данные заново без повторного согласия."""
+    rec = db_get(update.effective_user.id)
+    if rec:
+        ctx.user_data["user_id"]  = update.effective_user.id
+        ctx.user_data["username"] = update.effective_user.username or ""
+        # Подставляем текущие данные как подсказку
+        await update.message.reply_text(
+            f"✏️ *Изменение данных*\n\n"
+            f"Текущие данные:\n"
+            f"👤 {rec['full_name']}\n"
+            f"📱 {rec['phone']}\n"
+            f"📧 {rec['email']}\n\n"
+            f"Введите новое ФИО (или отправьте то же самое если менять не нужно):",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return S_FULLNAME
+    else:
+        await update.message.reply_text(
+            "Вы ещё не зарегистрированы. Нажмите /start чтобы начать.",
+            reply_markup=main_kb())
+        return ConversationHandler.END
+
+async def cb_go_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопка поддержки из меню оплаты."""
+    q = update.callback_query; await q.answer()
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="support_cancel")]]
+    await q.message.reply_text(
+        "💬 *Напишите ваш вопрос* — отвечу в ближайшее время.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return S_SUPPORT
+
 # ═══════════════════════════════════════════════════════════
 #  ADMIN
 # ═══════════════════════════════════════════════════════════
@@ -672,16 +749,21 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_confirm(user_id, amount)
     rec = db_get(user_id)
     full_name = rec["full_name"] if rec else "Участник"
+
+    confirm_msg = T_PAYMENT_CONFIRMED.format(
+        full_name=full_name, date=WORKSHOP_DATE_STR
+    )
     receipt = T_RECEIPT.format(
         ip_fio=IP_FIO, ip_inn=IP_INN, ip_ogrnip=IP_OGRNIP,
         full_name=full_name, workshop_date=WORKSHOP_DATE_STR,
         amount=amount, pay_date=datetime.now().strftime("%d.%m.%Y %H:%M")
     )
     try:
+        await ctx.bot.send_message(chat_id=user_id, text=confirm_msg, parse_mode=ParseMode.MARKDOWN)
         await ctx.bot.send_message(chat_id=user_id, text=receipt, parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text(f"✅ Подтверждено. Чек отправлен — {full_name}.")
+        await update.message.reply_text(f"✅ Подтверждено. Сообщение и чек отправлены — {full_name}.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Не удалось отправить чек: {e}")
+        await update.message.reply_text(f"⚠️ Не удалось отправить сообщение: {e}")
 
 async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
@@ -884,13 +966,29 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    edit_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^✏️ Изменить данные$"), menu_edit_data)],
+        states={
+            S_FULLNAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rx_fullname)],
+            S_PHONE:      [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), rx_phone)],
+            S_EMAIL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, rx_email)],
+            S_PAYMENT:    [CallbackQueryHandler(cb_payment_done, pattern="^payment_done$")],
+            S_SCREENSHOT: [MessageHandler(filters.PHOTO | filters.Document.IMAGE |
+                                          (filters.TEXT & ~filters.COMMAND), rx_screenshot)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(reg_conv)
+    app.add_handler(edit_conv)
     app.add_handler(support_conv)
     app.add_handler(broadcast_conv)
 
     app.add_handler(MessageHandler(filters.Regex("^📋 Моя регистрация$"), menu_my_reg))
+    app.add_handler(MessageHandler(filters.Regex("^💳 Повторить оплату$"), menu_resend_qr))
     app.add_handler(MessageHandler(filters.Regex("^📄 Оферта$"),          menu_offer))
     app.add_handler(MessageHandler(filters.Regex("^🔒 Политика данных$"), menu_privacy))
+    app.add_handler(CallbackQueryHandler(cb_go_support, pattern="^go_support$"))
 
     app.add_handler(CommandHandler("participants", cmd_participants))
     app.add_handler(CommandHandler("export",       cmd_export))
