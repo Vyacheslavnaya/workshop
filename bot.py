@@ -34,7 +34,7 @@ except ImportError:
 BOT_TOKEN          = "8757283175:AAEy1joRPQl-QfFJ84QvtgqW1vgXaormSjg"           # токен от @BotFather
 ADMIN_IDS          = [334618540]                # твой Telegram user_id
 
-WORKSHOP_DATE_STR  = "01 июня 2025, 12:00"   # дата для показа
+WORKSHOP_DATE_STR  = "07 июня 2025"   # дата для показа
 WORKSHOP_DATETIME  = datetime(2025, 7, 15, 10, 0)
 WORKSHOP_PRICE     = 10000
 WORKSHOP_LOCATION  = "Ссылка появится за день до воркшопа"
