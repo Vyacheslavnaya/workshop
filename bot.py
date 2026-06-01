@@ -31,10 +31,10 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 #  НАСТРОЙКИ — заполни перед запуском
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN          = "YOUR_BOT_TOKEN"           # токен от @BotFather
-ADMIN_IDS          = [123456789]                # твой Telegram user_id
+BOT_TOKEN          = "8757283175:AAEy1joRPQl-QfFJ84QvtgqW1vgXaormSjg"           # токен от @BotFather
+ADMIN_IDS          = [334618540]                # твой Telegram user_id
 
-WORKSHOP_DATE_STR  = "ХХ месяца 2025, ХХ:00"   # дата для показа
+WORKSHOP_DATE_STR  = "07 июня 2025"   # дата для показа
 WORKSHOP_DATETIME  = datetime(2025, 7, 15, 10, 0)
 WORKSHOP_PRICE     = 10000
 WORKSHOP_LOCATION  = "Ссылка появится за день до воркшопа"
@@ -44,10 +44,10 @@ DB_PATH            = "bot.db"
 
 # Реквизиты ИП
 IP_FIO             = "Пшинник Елена Борисовна"
-IP_INN             = "XXXXXXXXXXXX"             # ← вставь ИНН
-IP_OGRNIP          = "XXXXXXXXXXXXXXX"          # ← вставь ОГРНИП
+IP_INN             = "622601705505"             # ← вставь ИНН
+IP_OGRNIP          = "1027739609391"          # ← вставь ОГРНИП
 IP_EMAIL           = "elena-pshinnik@mail.ru"
-IP_ADDRESS         = "УКАЖИ ЮРИДИЧЕСКИЙ АДРЕС ИП"
+IP_ADDRESS         = "107031, Г. МОСКВА, г Москва, г МОСКВА, УЛ РОЖДЕСТВЕНКА, 10/2, СТР 1"
 
 # ═══════════════════════════════════════════════════════════
 #  СОСТОЯНИЯ
