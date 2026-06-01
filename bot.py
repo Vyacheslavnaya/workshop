@@ -415,7 +415,8 @@ def main_kb():
     return ReplyKeyboardMarkup(
         [["📋 Моя регистрация", "💬 Поддержка"],
          ["💳 Повторить оплату", "✏️ Изменить данные"],
-         ["📄 Оферта",          "🔒 Политика данных"]],
+         ["📞 Связаться с организатором"],
+         ["📄 Оферта", "🔒 Политика данных"]],
         resize_keyboard=True
     )
 
@@ -661,6 +662,17 @@ async def menu_my_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 {rec['full_name']}\n📱 {rec['phone']}\n📧 {rec['email']}\n\n"
         f"{e} Статус: *{rec['status']}*\n📅 {WORKSHOP_DATE_STR}",
         parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb()
+    )
+
+async def menu_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «📞 Связаться с организатором»"""
+    await update.message.reply_text(
+        "📞 *Связаться с организатором*\n\n"
+        "Если у вас есть вопросы — напишите напрямую в Telegram:\n\n"
+        "👉 @whatshappened\n\n"
+        "_Или нажмите кнопку «💬 Поддержка» — ваш вопрос придёт организатору прямо в бот._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_kb()
     )
 
 async def menu_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -985,6 +997,7 @@ def main():
     app.add_handler(broadcast_conv)
 
     app.add_handler(MessageHandler(filters.Regex("^📋 Моя регистрация$"), menu_my_reg))
+    app.add_handler(MessageHandler(filters.Regex("^📞 Связаться с организатором$"), menu_contact))
     app.add_handler(MessageHandler(filters.Regex("^💳 Повторить оплату$"), menu_resend_qr))
     app.add_handler(MessageHandler(filters.Regex("^📄 Оферта$"),          menu_offer))
     app.add_handler(MessageHandler(filters.Regex("^🔒 Политика данных$"), menu_privacy))
