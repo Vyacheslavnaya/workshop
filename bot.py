@@ -198,12 +198,18 @@ def db_find_by_contact(email: str, phone: str) -> dict | None:
     return None
 
 def db_add_pending(email: str, phone: str, amount: str):
-    """Сохраняет оплату с сайта, под которую ещё нет участника в боте."""
+    """Сохраняет оплату с сайта, под которую ещё нет участника в боте.
+    Дедуп: повторные вебхуки по тому же email/телефону не плодят строки."""
+    e = (email or "").strip().lower()
+    p = norm_phone(phone)
     with db() as conn:
+        if e:
+            conn.execute("DELETE FROM pending_payments WHERE email=?", (e,))
+        if p:
+            conn.execute("DELETE FROM pending_payments WHERE phone=?", (p,))
         conn.execute(
             "INSERT INTO pending_payments (email, phone, amount, created) VALUES (?, ?, ?, ?)",
-            ((email or "").strip().lower(), norm_phone(phone), str(amount),
-             datetime.now().strftime("%d.%m.%Y %H:%M"))
+            (e, p, str(amount), datetime.now().strftime("%d.%m.%Y %H:%M"))
         )
 
 def db_pop_pending(email: str, phone: str) -> dict | None:
@@ -1149,6 +1155,34 @@ def _extract_payment(data: dict) -> tuple[str, str, str]:
         amount = str(WORKSHOP_PRICE)
     return email, phone, amount
 
+_bg_tasks: set = set()
+
+def _spawn(coro):
+    """Запускает фоновую корутину и держит ссылку, чтобы её не собрал GC."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+async def _notify_admins(bot, text: str):
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=aid, text=text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+async def _grant_and_notify(bot, rec: dict, email: str, phone: str, amount: str):
+    """Фоновая выдача доступа — чтобы вебхук успел ответить Тильде за 5 сек."""
+    try:
+        await grant_access(bot, rec, amount)
+    except Exception as e:
+        logging.error(f"grant_access error: {e}")
+    await _notify_admins(
+        bot,
+        (f"✅ Авто-подтверждение оплаты с Тильды\n"
+         f"👤 {rec.get('full_name')}\n📧 {email or '—'}  📱 {phone or '—'}\n💰 {amount} ₽\n"
+         f"🆔 `{rec['user_id']}` — доступ выдан.")
+    )
+
 async def handle_tilda_webhook(request: web.Request) -> web.Response:
     app = request.app["bot_app"]
     bot = app.bot
@@ -1193,39 +1227,23 @@ async def handle_tilda_webhook(request: web.Request) -> web.Response:
         # Человек оплатил на сайте раньше, чем зарегистрировался в боте.
         # Сохраняем оплату — доступ выдастся автоматически при регистрации.
         db_add_pending(email, phone, amount)
-        for aid in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    chat_id=aid,
-                    text=(f"💸 Оплата с сайта ({amount} ₽), но участник ещё не в боте.\n"
-                          f"📧 {email or '—'}  📱 {phone or '—'}\n"
-                          f"Оплата сохранена — доступ выдастся автоматически, когда человек "
-                          f"зарегистрируется в боте с тем же email/телефоном."),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception:
-                pass
+        _spawn(_notify_admins(
+            bot,
+            (f"💸 Оплата с сайта ({amount} ₽), но участник ещё не в боте.\n"
+             f"📧 {email or '—'}  📱 {phone or '—'}\n"
+             f"Оплата сохранена — доступ выдастся автоматически, когда человек "
+             f"зарегистрируется в боте с тем же email/телефоном.")
+        ))
         return web.Response(text="ok")
 
-    # Участник найден → подтверждаем и выдаём доступ
+    # Повторный вебхук Тильды по уже оплаченной заявке — не дублируем выдачу
+    if rec.get("status") == "Оплачено":
+        return web.Response(text="ok")
+
+    # Участник найден → подтверждаем; саму выдачу делаем в фоне, чтобы
+    # ответить Тильде за 5 секунд (иначе она шлёт повторы).
     db_confirm(rec["user_id"], amount)
-    try:
-        await grant_access(bot, rec, amount)
-    except Exception as e:
-        logging.error(f"grant_access error: {e}")
-
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                chat_id=aid,
-                text=(f"✅ Авто-подтверждение оплаты с Тильды\n"
-                      f"👤 {rec.get('full_name')}\n📧 {email or '—'}  📱 {phone or '—'}\n💰 {amount} ₽\n"
-                      f"🆔 `{rec['user_id']}` — доступ выдан."),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            pass
-
+    _spawn(_grant_and_notify(bot, rec, email, phone, amount))
     return web.Response(text="ok")
 
 async def handle_health(request: web.Request) -> web.Response:
