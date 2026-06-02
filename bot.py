@@ -1110,6 +1110,25 @@ async def on_chat_member_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.warning(f"Failed to remove unpaid user {uid}: {e}")
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик ошибок: пишет в лог, админам и пользователю."""
+    logging.exception("Unhandled update error", exc_info=ctx.error)
+    err_text = f"{type(ctx.error).__name__}: {ctx.error}"
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(chat_id=aid, text=f"⚠️ Ошибка бота:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await ctx.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=("⚠️ Внутренняя ошибка при обработке запроса.\n"
+                      "Попробуйте ещё раз через 5 секунд. Если повторится — нажмите «💬 Поддержка»."),
+            )
+    except Exception:
+        pass
+
 async def cb_go_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Кнопка поддержки из меню оплаты."""
     q = update.callback_query; await q.answer()
@@ -1534,7 +1553,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex("^📞 Связаться с организатором$"), menu_contact))
     app.add_handler(MessageHandler(filters.Regex("^💳 Повторить оплату$"), menu_resend_qr))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Проверить оплату$"), menu_check_payment))
-    app.add_handler(MessageHandler(filters.Regex("^🔗 Ссылка в канал$"), menu_send_channel_link))
+    # Ловим кнопку и текст без привязки к эмодзи/вариациям отображения.
+    app.add_handler(MessageHandler(filters.Regex("Ссылка в канал"), menu_send_channel_link))
+    app.add_handler(CommandHandler("link", menu_send_channel_link))
     app.add_handler(MessageHandler(filters.Regex("^📄 Оферта$"),          menu_offer))
     app.add_handler(MessageHandler(filters.Regex("^🔒 Политика данных$"), menu_privacy))
     app.add_handler(CallbackQueryHandler(cb_go_support, pattern="^go_support$"))
@@ -1552,6 +1573,8 @@ def build_app() -> Application:
     # Контроль доступа в закрытый канал
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+
+    app.add_error_handler(on_error)
 
     return app
 
