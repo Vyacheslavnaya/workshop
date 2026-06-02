@@ -21,7 +21,8 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
+    ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler,
+    filters, ContextTypes
 )
 from telegram.constants import ParseMode
 
@@ -352,7 +353,7 @@ T_DOCS = """
 
 T_FULLNAME = "✏️ *Введите ваше ФИО*\n\nФамилия Имя Отчество — полностью.\n_Пример: Иванова Мария Сергеевна_"
 T_PHONE    = "📱 *Введите номер телефона*\n\nФормат: +7XXXXXXXXXX\n\n_Или нажмите кнопку ниже_"
-T_EMAIL    = "📧 *Введите электронную почту*\n\n_Пример: name@mail.ru_"
+T_EMAIL    = "📧 *Шаг 2 из 2: введите электронную почту*\n\n_Пример: name@mail.ru_"
 
 T_PAYMENT = """
 💳 *Оплата участия*
@@ -393,7 +394,8 @@ T_PAYMENT_CONFIRMED = """
 
 Елена Борисовна получила информацию о вашей оплате и рада видеть вас на воркшопе!
 
-🔗 *Ссылку на Telegram-канал воркшопа* мы пришлём за день до мероприятия — следите за сообщениями от бота!
+🔗 *Ссылка в закрытый Telegram-канал* отправлена в этом чате.
+Если ссылка потерялась, нажмите кнопку *«🔗 Ссылка в канал»* в меню.
 
 📅 Воркшоп: *{date}*
 
@@ -512,9 +514,51 @@ def main_kb(user_id: int | None = None):
     rows = [["📋 Моя регистрация", "💬 Поддержка"]]
     if not is_paid:
         rows.append(["💳 Повторить оплату", "🔄 Проверить оплату"])
+    else:
+        rows.append(["🔗 Ссылка в канал"])
     rows.append(["✏️ Изменить данные", "📞 Связаться с организатором"])
     rows.append(["📄 Оферта", "🔒 Политика данных"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def is_paid_user(user_id: int) -> bool:
+    rec = db_get(user_id)
+    return bool(rec and rec.get("status") == "Оплачено")
+
+async def send_channel_invite(bot, user_id: int, full_name: str):
+    """Отправляет персональную ссылку в закрытый канал.
+    Ссылка создаётся как join-request: бот одобрит только оплаченных."""
+    if not WORKSHOP_CHANNEL_ID:
+        await bot.send_message(
+            chat_id=user_id,
+            text="⚠️ Канал пока не настроен. Напишите в поддержку, мы пришлём доступ вручную."
+        )
+        return
+    invite = await bot.create_chat_invite_link(
+        chat_id=WORKSHOP_CHANNEL_ID,
+        creates_join_request=True,
+        expire_date=datetime.now() + timedelta(days=7),
+        name=f"{full_name[:28]}",
+    )
+    await bot.send_message(
+        chat_id=user_id,
+        text=("🔗 *Ваша ссылка в закрытый канал воркшопа:*\n\n"
+              f"{invite.invite_link}\n\n"
+              "После перехода нажмите «Join». Бот автоматически одобрит доступ, "
+              "если оплата подтверждена."),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def has_channel_access(bot, user_id: int) -> bool:
+    """Проверяет, состоит ли пользователь в закрытом канале воркшопа."""
+    if not WORKSHOP_CHANNEL_ID:
+        return False
+    try:
+        member = await bot.get_chat_member(WORKSHOP_CHANNEL_ID, user_id)
+        # left/kicked — доступа нет. Остальные статусы считаем валидным доступом.
+        return member.status not in ("left", "kicked")
+    except Exception as e:
+        logging.warning(f"Channel access check failed for {user_id}: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════
 #  /start
@@ -545,6 +589,23 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 "После оплаты нажмите «🔄 Проверить оплату» в меню.",
                 reply_markup=main_kb(update.effective_user.id)
             )
+        return ConversationHandler.END
+    # Запись могла потеряться (например, после рестарта), но доступ уже выдан.
+    # Если пользователь уже состоит в закрытом канале — восстанавливаем статус.
+    if await has_channel_access(ctx.bot, update.effective_user.id):
+        user = update.effective_user
+        db_add({
+            "user_id": user.id,
+            "username": user.username or "",
+            "full_name": user.full_name or "Участник",
+            "phone": "",
+            "email": "",
+        })
+        db_confirm(user.id, str(WORKSHOP_PRICE))
+        await update.message.reply_text(
+            "✅ Доступ уже активен. Вижу вас среди участников закрытого канала.",
+            reply_markup=main_kb(user.id),
+        )
         return ConversationHandler.END
     ctx.user_data.clear()
     kb = [[InlineKeyboardButton("📄 Ознакомиться с документами →", callback_data="show_docs")]]
@@ -607,9 +668,15 @@ async def cb_consent_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     ctx.user_data["user_id"]  = q.from_user.id
     ctx.user_data["username"] = q.from_user.username or ""
+    ctx.user_data["full_name"] = q.from_user.full_name or "Участник"
     await q.edit_message_text("✅ Согласие получено! Начинаем регистрацию.")
-    await q.message.reply_text(T_FULLNAME, parse_mode=ParseMode.MARKDOWN)
-    return S_FULLNAME
+    kb = [[KeyboardButton("📱 Отправить мой номер", request_contact=True)]]
+    await q.message.reply_text(
+        "📱 *Шаг 1 из 2: номер телефона*\n\nОтправьте ваш номер или введите вручную в формате +7XXXXXXXXXX.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
+    )
+    return S_PHONE
 
 async def cb_consent_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
@@ -640,6 +707,8 @@ async def rx_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⚠️ Введите корректный номер (+79991234567).")
             return S_PHONE
     ctx.user_data["phone"] = phone
+    if not ctx.user_data.get("full_name"):
+        ctx.user_data["full_name"] = update.effective_user.full_name or "Участник"
     await update.message.reply_text(T_EMAIL, parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=ReplyKeyboardRemove())
     return S_EMAIL
@@ -649,10 +718,29 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if "@" not in email or "." not in email.split("@")[-1]:
         await update.message.reply_text("⚠️ Введите корректный email.")
         return S_EMAIL
-    ctx.user_data["email"] = email
+    data = ctx.user_data
+    data["email"] = email
+    # Если пользователь уже есть по email/телефону — подтягиваем сохранённое ФИО.
+    rec_existing = db_find_by_contact(email, data.get("phone", ""))
+    if rec_existing and rec_existing.get("full_name"):
+        data["full_name"] = rec_existing["full_name"]
+    # Если по контактам уже есть оплаченный участник — сразу восстанавливаем доступ.
+    if rec_existing and rec_existing.get("status") == "Оплачено":
+        db_add({"user_id": data["user_id"], "username": data.get("username", ""),
+                "full_name": data["full_name"], "phone": data["phone"], "email": email})
+        db_confirm(data["user_id"], rec_existing.get("amount") or str(WORKSHOP_PRICE))
+        rec = db_get(data["user_id"])
+        await update.message.reply_text(
+            "✅ Оплата уже найдена по вашим данным. Восстанавливаю доступ 🌸",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(data["user_id"])
+        )
+        try:
+            await grant_access(ctx.bot, rec, rec_existing.get("amount") or str(WORKSHOP_PRICE))
+        except Exception as e:
+            logging.error(f"grant_access (existing paid) error: {e}")
+        return ConversationHandler.END
 
     # Проверяем: вдруг человек уже оплатил на сайте до регистрации в боте?
-    data = ctx.user_data
     pend = db_pop_pending(email, data.get("phone", ""))
     if pend:
         db_add({"user_id": data["user_id"], "username": data.get("username", ""),
@@ -912,6 +1000,67 @@ async def menu_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
+async def menu_send_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🔗 Ссылка в канал» — повторная выдача ссылки оплаченному пользователю."""
+    uid = update.effective_user.id
+    rec = db_get(uid)
+    if not rec:
+        await update.message.reply_text(
+            "Вы ещё не зарегистрированы. Нажмите /start.",
+            reply_markup=main_kb(uid),
+        )
+        return
+    if rec["status"] != "Оплачено":
+        kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
+        await update.message.reply_text(
+            "Ссылка в канал доступна только после подтверждённой оплаты.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+    await send_channel_invite(ctx.bot, uid, rec.get("full_name") or update.effective_user.full_name or "Участник")
+    await update.message.reply_text("Если ссылка не открылась, нажмите кнопку ещё раз.", reply_markup=main_kb(uid))
+
+async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Одобряет заявку в канал только для оплаченных пользователей."""
+    req = update.chat_join_request
+    if not req:
+        return
+    uid = req.from_user.id
+    chat_id = req.chat.id
+    if WORKSHOP_CHANNEL_ID and chat_id != WORKSHOP_CHANNEL_ID:
+        return
+    if is_paid_user(uid):
+        await ctx.bot.approve_chat_join_request(chat_id=chat_id, user_id=uid)
+        try:
+            await ctx.bot.send_message(uid, "✅ Доступ в канал подтверждён. Добро пожаловать!")
+        except Exception:
+            pass
+    else:
+        await ctx.bot.decline_chat_join_request(chat_id=chat_id, user_id=uid)
+        try:
+            await ctx.bot.send_message(
+                uid,
+                f"❌ Доступ в канал только после оплаты.\nОплатить: {PAYMENT_PAGE_URL}"
+            )
+        except Exception:
+            pass
+
+async def on_chat_member_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Если неоплаченный пользователь уже вошёл в канал — удаляем его."""
+    cm = update.chat_member
+    if not cm:
+        return
+    if WORKSHOP_CHANNEL_ID and cm.chat.id != WORKSHOP_CHANNEL_ID:
+        return
+    uid = cm.new_chat_member.user.id
+    new_status = cm.new_chat_member.status
+    if new_status in ("member", "administrator", "creator") and not is_paid_user(uid):
+        try:
+            await ctx.bot.ban_chat_member(chat_id=cm.chat.id, user_id=uid)
+            await ctx.bot.unban_chat_member(chat_id=cm.chat.id, user_id=uid, only_if_banned=True)
+        except Exception as e:
+            logging.warning(f"Failed to remove unpaid user {uid}: {e}")
+
 async def cb_go_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Кнопка поддержки из меню оплаты."""
     q = update.callback_query; await q.answer()
@@ -1118,33 +1267,21 @@ async def grant_access(bot, rec: dict, amount: str):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # 2. Персональная одноразовая ссылка-приглашение в закрытый канал
-    if WORKSHOP_CHANNEL_ID:
-        try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=WORKSHOP_CHANNEL_ID,
-                member_limit=1,
-                name=f"{full_name[:28]}",
-            )
-            await bot.send_message(
-                chat_id=user_id,
-                text=("🔗 *Ваш доступ к закрытому каналу воркшопа:*\n\n"
-                      f"{invite.invite_link}\n\n"
-                      "_Ссылка персональная и одноразовая — не передавайте её другим._"),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as e:
-            logging.error(f"Invite link error for {user_id}: {e}")
-            for aid in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        chat_id=aid,
-                        text=(f"⚠️ Оплата {full_name} подтверждена, но не удалось создать "
-                              f"ссылку в канал: {e}\nВыдайте доступ вручную (user_id `{user_id}`)."),
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                except Exception:
-                    pass
+    # 2. Персональная ссылка-приглашение в закрытый канал
+    try:
+        await send_channel_invite(bot, user_id, full_name)
+    except Exception as e:
+        logging.error(f"Invite link error for {user_id}: {e}")
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=aid,
+                    text=(f"⚠️ Оплата {full_name} подтверждена, но не удалось создать "
+                          f"ссылку в канал: {e}\nВыдайте доступ вручную (user_id `{user_id}`)."),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
 
 # ═══════════════════════════════════════════════════════════
 #  HTTP-ЭНДПОИНТ ДЛЯ ВЕБХУКА ТИЛЬДЫ
@@ -1331,6 +1468,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex("^📞 Связаться с организатором$"), menu_contact))
     app.add_handler(MessageHandler(filters.Regex("^💳 Повторить оплату$"), menu_resend_qr))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Проверить оплату$"), menu_check_payment))
+    app.add_handler(MessageHandler(filters.Regex("^🔗 Ссылка в канал$"), menu_send_channel_link))
     app.add_handler(MessageHandler(filters.Regex("^📄 Оферта$"),          menu_offer))
     app.add_handler(MessageHandler(filters.Regex("^🔒 Политика данных$"), menu_privacy))
     app.add_handler(CallbackQueryHandler(cb_go_support, pattern="^go_support$"))
@@ -1344,6 +1482,10 @@ def build_app() -> Application:
         filters.Regex(r"^/confirm_\d+_\d+") & filters.ChatType.PRIVATE, cmd_confirm))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/reply_\d+") & filters.ChatType.PRIVATE, cmd_reply))
+
+    # Контроль доступа в закрытый канал
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     return app
 
