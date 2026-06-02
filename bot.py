@@ -135,6 +135,11 @@ def norm_phone(raw) -> str:
         digits = "7" + digits
     return digits[-11:] if len(digits) >= 11 else digits
 
+def phone_tail10(raw) -> str:
+    """Хвост из 10 цифр для мягкого сравнения номеров между системами."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
 def db_add(data: dict) -> bool:
     try:
         with db() as conn:
@@ -196,11 +201,15 @@ def db_find_by_contact(email: str, phone: str) -> dict | None:
     if rec:
         return rec
     target = norm_phone(phone)
+    target10 = phone_tail10(phone)
     if target:
         with db() as conn:
             rows = conn.execute("SELECT * FROM participants ORDER BY id DESC").fetchall()
         for r in rows:
-            if norm_phone(r["phone"]) == target:
+            row_phone = r["phone"]
+            if norm_phone(row_phone) == target:
+                return dict(r)
+            if target10 and phone_tail10(row_phone) == target10:
                 return dict(r)
     return None
 
@@ -224,6 +233,7 @@ def db_pop_pending(email: str, phone: str) -> dict | None:
     Вызывается, когда человек регистрируется в боте после оплаты на сайте."""
     e = (email or "").strip().lower()
     p = norm_phone(phone)
+    p10 = phone_tail10(phone)
     with db() as conn:
         row = None
         if e:
@@ -234,6 +244,12 @@ def db_pop_pending(email: str, phone: str) -> dict | None:
             row = conn.execute(
                 "SELECT * FROM pending_payments WHERE phone=? ORDER BY id DESC LIMIT 1", (p,)
             ).fetchone()
+        if not row and p10:
+            rows = conn.execute("SELECT * FROM pending_payments ORDER BY id DESC").fetchall()
+            for r in rows:
+                if phone_tail10(r["phone"]) == p10:
+                    row = r
+                    break
         if row:
             conn.execute("DELETE FROM pending_payments WHERE id=?", (row["id"],))
             return dict(row)
@@ -1306,6 +1322,35 @@ def _extract_payment(data: dict) -> tuple[str, str, str]:
         except (ValueError, TypeError):
             pass
 
+    # Резервный парсинг: у Тильды поля могут приходить с кастомными именами
+    # (например, Телефон, phone_123, custom_email и т.д.).
+    if not email or not phone:
+        for k, v in data.items():
+            key = str(k).strip().lower()
+            val = str(v or "").strip()
+            if not val:
+                continue
+            if (not email) and ("@" in val and "." in val.split("@")[-1]):
+                if any(token in key for token in ("email", "e-mail", "mail", "почт")):
+                    email = val.lower()
+            if not phone:
+                if any(token in key for token in ("phone", "tel", "тел", "моб")):
+                    if phone_tail10(val):
+                        phone = val
+
+    # Крайний fallback: если ключи странные, ищем похожие значения без привязки к имени поля
+    if not email or not phone:
+        for v in data.values():
+            val = str(v or "").strip()
+            if not val:
+                continue
+            if (not email) and ("@" in val and "." in val.split("@")[-1]):
+                email = val.lower()
+            if (not phone) and phone_tail10(val):
+                # Игнорируем суммы/ID: номер телефона обычно >=10 цифр.
+                if len("".join(ch for ch in val if ch.isdigit())) >= 10:
+                    phone = val
+
     if not amount:
         amount = str(WORKSHOP_PRICE)
     return email, phone, amount
@@ -1363,7 +1408,10 @@ async def handle_tilda_webhook(request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
     email, phone, amount = _extract_payment(data)
-    logging.info(f"Tilda webhook: email={email}, phone={phone}, amount={amount}")
+    logging.info(
+        f"Tilda webhook: email={email or '-'}, phone_raw={phone or '-'}, "
+        f"phone_norm={norm_phone(phone) or '-'}, amount={amount}"
+    )
 
     if not email and not phone:
         for aid in ADMIN_IDS:
