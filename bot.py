@@ -19,6 +19,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 )
+from telegram.error import TelegramError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler,
@@ -540,6 +541,18 @@ def is_paid_user(user_id: int) -> bool:
     rec = db_get(user_id)
     return bool(rec and rec.get("status") == "Оплачено")
 
+def _invite_error_hint(err_msg: str) -> str:
+    low = err_msg.lower()
+    if "chat_admin_required" in low or "not enough rights" in low:
+        return "Боту не хватает прав администратора (invite links / join requests)."
+    if "chat not found" in low:
+        return "Канал не найден: проверьте WORKSHOP_CHANNEL_ID и что бот добавлен в этот канал."
+    if "peer_id_invalid" in low:
+        return "Некорректный ID канала. Нужен формат -100xxxxxxxxxx."
+    if "forbidden" in low:
+        return "Бот не имеет доступа к каналу. Проверьте, что он админ этого канала."
+    return "Проверьте права бота в канале и корректность WORKSHOP_CHANNEL_ID."
+
 async def send_channel_invite(bot, user_id: int, full_name: str) -> bool:
     """Отправляет персональную ссылку в закрытый канал.
     Ссылка создаётся как join-request: бот одобрит только оплаченных."""
@@ -565,24 +578,63 @@ async def send_channel_invite(bot, user_id: int, full_name: str) -> bool:
             parse_mode=ParseMode.MARKDOWN,
         )
         return True
-    except Exception as e:
-        logging.error(f"send_channel_invite error for {user_id}: {e}")
+    except TelegramError as e:
+        err = str(e)
+        hint = _invite_error_hint(err)
+        logging.error(f"send_channel_invite error for {user_id}: {err}")
         await bot.send_message(
             chat_id=user_id,
             text=("⚠️ Не удалось создать ссылку в канал автоматически.\n"
+                  f"Причина: {err}\n"
+                  f"{hint}\n\n"
                   "Напишите в поддержку, мы выдадим доступ вручную."),
         )
         for aid in ADMIN_IDS:
             try:
                 await bot.send_message(
                     chat_id=aid,
-                    text=(f"⚠️ Ошибка выдачи ссылки в канал: {e}\n"
+                    text=(f"⚠️ Ошибка выдачи ссылки в канал: {err}\n"
+                          f"Подсказка: {hint}\n"
+                          f"channel_id: `{WORKSHOP_CHANNEL_ID}`\n"
                           f"user_id `{user_id}`, ФИО: {full_name}"),
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
                 pass
         return False
+    except Exception as e:
+        err = str(e)
+        logging.error(f"send_channel_invite unexpected error for {user_id}: {err}")
+        await bot.send_message(
+            chat_id=user_id,
+            text=("⚠️ Не удалось создать ссылку в канал автоматически.\n"
+                  f"Причина: {err}\n"
+                  "Напишите в поддержку, мы выдадим доступ вручную."),
+        )
+        return False
+
+async def cmd_check_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Админ-команда: проверка прав бота в канале."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not WORKSHOP_CHANNEL_ID:
+        await update.message.reply_text("⚠️ WORKSHOP_CHANNEL_ID не задан.")
+        return
+    try:
+        me = await ctx.bot.get_me()
+        chat = await ctx.bot.get_chat(WORKSHOP_CHANNEL_ID)
+        member = await ctx.bot.get_chat_member(WORKSHOP_CHANNEL_ID, me.id)
+        can_invite = getattr(member, "can_invite_users", None)
+        await update.message.reply_text(
+            f"📡 Проверка канала\n\n"
+            f"chat_id: `{WORKSHOP_CHANNEL_ID}`\n"
+            f"title: {getattr(chat, 'title', '—')}\n"
+            f"bot_status: {member.status}\n"
+            f"can_invite_users: {can_invite}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ checkchannel error: {e}")
 
 async def has_channel_access(bot, user_id: int) -> bool:
     """Проверяет, состоит ли пользователь в закрытом канале воркшопа."""
@@ -1249,6 +1301,7 @@ async def cmd_admin_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/participants — список участников\n"
         "/export — скачать Excel\n"
         "/stats — статистика\n"
+        "/checkchannel — проверить права бота в канале\n"
         "/broadcast — рассылка сообщения\n"
         "/confirm\\_ID\\_СУММА — подтвердить оплату\n"
         "/reply\\_ID текст — ответить участнице\n\n"
@@ -1564,6 +1617,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("export",       cmd_export))
     app.add_handler(CommandHandler("stats",        cmd_stats))
     app.add_handler(CommandHandler("admin",        cmd_admin_help))
+    app.add_handler(CommandHandler("checkchannel", cmd_check_channel))
     app.add_handler(CallbackQueryHandler(cb_export_excel, pattern="^export_excel$"))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/confirm_\d+_\d+") & filters.ChatType.PRIVATE, cmd_confirm))
