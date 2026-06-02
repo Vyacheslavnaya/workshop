@@ -7,9 +7,13 @@ Telegram-бот «Большой день женского здоровья» с
 import asyncio
 import logging
 import io
+import os
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+
+from aiohttp import web
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -29,18 +33,37 @@ except ImportError:
     HAS_OPENPYXL = False
 
 # ═══════════════════════════════════════════════════════════
-#  НАСТРОЙКИ — заполни перед запуском
+#  НАСТРОЙКИ — берутся из переменных окружения (Railway → Variables).
+#  Значения справа от or — локальный fallback для запуска на своём ПК.
+#
+#  ⚠️ ВАЖНО: токен ниже когда-то попал в публичный репозиторий —
+#  отзови его у @BotFather (/revoke) и задай новый через переменную BOT_TOKEN.
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN          = "8757283175:AAEy1joRPQl-QfFJ84QvtgqW1vgXaormSjg"           # токен от @BotFather
-ADMIN_IDS          = [334618540]                # твой Telegram user_id
+def _env_admin_ids(name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(name, "")
+    ids = [int(x) for x in raw.replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
+    return ids or default
 
-WORKSHOP_DATE_STR  = "07 июня 2025"   # дата для показа
+BOT_TOKEN          = os.getenv("BOT_TOKEN", "8757283175:AAEy1joRPQl-QfFJ84QvtgqW1vgXaormSjg")
+ADMIN_IDS          = _env_admin_ids("ADMIN_IDS", [334618540])
+
+WORKSHOP_DATE_STR  = os.getenv("WORKSHOP_DATE_STR", "07 июня 2025")   # дата для показа
 WORKSHOP_DATETIME  = datetime(2025, 7, 15, 10, 0)
-WORKSHOP_PRICE     = 10000
-WORKSHOP_LOCATION  = "Ссылка появится за день до воркшопа"
+WORKSHOP_PRICE     = int(os.getenv("WORKSHOP_PRICE", "10000"))
+WORKSHOP_LOCATION  = os.getenv("WORKSHOP_LOCATION", "Ссылка появится за день до воркшопа")
 
-QR_IMAGE_PATH      = "qr_sbp.png"
-DB_PATH            = "bot.db"
+QR_IMAGE_PATH      = os.getenv("QR_IMAGE_PATH", "qr_sbp.png")
+DB_PATH            = os.getenv("DB_PATH", "bot.db")
+
+# ── Приём вебхука от Тильды и автоматическая выдача доступа ──
+# Секрет, который Тильда передаёт в URL: /tilda-webhook?secret=...  (защита эндпоинта)
+TILDA_WEBHOOK_SECRET = os.getenv("TILDA_WEBHOOK_SECRET", "")
+# ID закрытого Telegram-канала/группы (вида -1001234567890). Бот должен быть там админом
+# с правом «Приглашать пользователей / создавать ссылки-приглашения».
+_chan = os.getenv("WORKSHOP_CHANNEL_ID", "").strip()
+WORKSHOP_CHANNEL_ID  = int(_chan) if _chan.lstrip("-").isdigit() else None
+# Порт HTTP-сервера (Railway подставляет автоматически).
+PORT                 = int(os.getenv("PORT", "8080"))
 
 # Реквизиты ИП
 IP_FIO             = "Пшинник Елена Борисовна"
@@ -89,6 +112,26 @@ def init_db():
                 note        TEXT DEFAULT ''
             )
         """)
+        # Оплаты с сайта, для которых ещё нет участника в боте
+        # (человек оплатил раньше, чем зарегистрировался). Матчим по email/телефону.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                email     TEXT DEFAULT '',
+                phone     TEXT DEFAULT '',
+                amount    TEXT DEFAULT '',
+                created   TEXT
+            )
+        """)
+
+def norm_phone(raw) -> str:
+    """Приводит телефон к каноническому виду 7XXXXXXXXXX для сравнения."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    return digits[-11:] if len(digits) >= 11 else digits
 
 def db_add(data: dict) -> bool:
     try:
@@ -127,6 +170,61 @@ def db_get(user_id: int) -> dict | None:
     with db() as conn:
         row = conn.execute("SELECT * FROM participants WHERE user_id=?", (user_id,)).fetchone()
         return dict(row) if row else None
+
+def db_get_by_email(email: str) -> dict | None:
+    """Поиск участника по email (без учёта регистра) — для матчинга оплаты с Тильды.
+    Берём самую свежую запись на случай нескольких регистраций с одним email."""
+    if not email:
+        return None
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM participants WHERE LOWER(email)=LOWER(?) ORDER BY id DESC LIMIT 1",
+            (email.strip(),)
+        ).fetchone()
+        return dict(row) if row else None
+
+def db_find_by_contact(email: str, phone: str) -> dict | None:
+    """Ищет участника по email ИЛИ по нормализованному телефону."""
+    rec = db_get_by_email(email) if email else None
+    if rec:
+        return rec
+    target = norm_phone(phone)
+    if target:
+        with db() as conn:
+            rows = conn.execute("SELECT * FROM participants ORDER BY id DESC").fetchall()
+        for r in rows:
+            if norm_phone(r["phone"]) == target:
+                return dict(r)
+    return None
+
+def db_add_pending(email: str, phone: str, amount: str):
+    """Сохраняет оплату с сайта, под которую ещё нет участника в боте."""
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO pending_payments (email, phone, amount, created) VALUES (?, ?, ?, ?)",
+            ((email or "").strip().lower(), norm_phone(phone), str(amount),
+             datetime.now().strftime("%d.%m.%Y %H:%M"))
+        )
+
+def db_pop_pending(email: str, phone: str) -> dict | None:
+    """Находит ожидающую оплату по email/телефону, удаляет её и возвращает.
+    Вызывается, когда человек регистрируется в боте после оплаты на сайте."""
+    e = (email or "").strip().lower()
+    p = norm_phone(phone)
+    with db() as conn:
+        row = None
+        if e:
+            row = conn.execute(
+                "SELECT * FROM pending_payments WHERE email=? ORDER BY id DESC LIMIT 1", (e,)
+            ).fetchone()
+        if not row and p:
+            row = conn.execute(
+                "SELECT * FROM pending_payments WHERE phone=? ORDER BY id DESC LIMIT 1", (p,)
+            ).fetchone()
+        if row:
+            conn.execute("DELETE FROM pending_payments WHERE id=?", (row["id"],))
+            return dict(row)
+    return None
 
 def db_paid_ids() -> list[int]:
     with db() as conn:
@@ -534,6 +632,42 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⚠️ Введите корректный email.")
         return S_EMAIL
     ctx.user_data["email"] = email
+
+    # Проверяем: вдруг человек уже оплатил на сайте до регистрации в боте?
+    data = ctx.user_data
+    pend = db_pop_pending(email, data.get("phone", ""))
+    if pend:
+        db_add({"user_id": data["user_id"], "username": data.get("username", ""),
+                "full_name": data["full_name"], "phone": data["phone"], "email": email})
+        amount = pend.get("amount") or str(WORKSHOP_PRICE)
+        db_confirm(data["user_id"], amount)
+        rec = db_get(data["user_id"])
+        await update.message.reply_text(
+            "✅ *Мы нашли вашу оплату на сайте!*\nОткрываю доступ 🌸",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb()
+        )
+        try:
+            await grant_access(ctx.bot, rec, amount)
+        except Exception as e:
+            logging.error(f"grant_access (pending) error: {e}")
+        for aid in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=aid,
+                    text=(f"✅ Авто-доступ: участник зарегистрировался после оплаты на сайте.\n"
+                          f"👤 {data['full_name']}\n📧 {email}  📱 {data['phone']}\n"
+                          f"💰 {amount} ₽  🆔 `{data['user_id']}`"),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        remind_at = WORKSHOP_DATETIME - timedelta(days=1)
+        if remind_at > datetime.now():
+            ctx.job_queue.run_once(job_reminder, when=remind_at,
+                                   data={"user_id": data["user_id"]},
+                                   name=f"reminder_{data['user_id']}")
+        return ConversationHandler.END
+
     kb = [[InlineKeyboardButton("✅ Я оплатила", callback_data="payment_done")]]
     await update.message.reply_text(
         T_PAYMENT.format(price=WORKSHOP_PRICE),
@@ -937,12 +1071,170 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════════════════
+#  АВТОВЫДАЧА ДОСТУПА (вызывается из вебхука Тильды)
+# ═══════════════════════════════════════════════════════════
+async def grant_access(bot, rec: dict, amount: str):
+    """Подтверждает оплату участнику и выдаёт доступ:
+    сообщение-подтверждение + чек + персональная одноразовая ссылка в канал."""
+    user_id   = rec["user_id"]
+    full_name = rec.get("full_name") or "Участник"
+
+    # 1. Подтверждение
+    await bot.send_message(
+        chat_id=user_id,
+        text=T_PAYMENT_CONFIRMED.format(full_name=full_name, date=WORKSHOP_DATE_STR),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # 2. Чек
+    receipt = T_RECEIPT.format(
+        ip_fio=IP_FIO, ip_inn=IP_INN, ip_ogrnip=IP_OGRNIP,
+        full_name=full_name, workshop_date=WORKSHOP_DATE_STR,
+        amount=amount, pay_date=datetime.now().strftime("%d.%m.%Y %H:%M"),
+    )
+    await bot.send_message(chat_id=user_id, text=receipt, parse_mode=ParseMode.MARKDOWN)
+
+    # 3. Персональная одноразовая ссылка-приглашение в закрытый канал
+    if WORKSHOP_CHANNEL_ID:
+        try:
+            invite = await bot.create_chat_invite_link(
+                chat_id=WORKSHOP_CHANNEL_ID,
+                member_limit=1,
+                name=f"{full_name[:28]}",
+            )
+            await bot.send_message(
+                chat_id=user_id,
+                text=("🔗 *Ваш доступ к закрытому каналу воркшопа:*\n\n"
+                      f"{invite.invite_link}\n\n"
+                      "_Ссылка персональная и одноразовая — не передавайте её другим._"),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logging.error(f"Invite link error for {user_id}: {e}")
+            for aid in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        chat_id=aid,
+                        text=(f"⚠️ Оплата {full_name} подтверждена, но не удалось создать "
+                              f"ссылку в канал: {e}\nВыдайте доступ вручную (user_id `{user_id}`)."),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+# ═══════════════════════════════════════════════════════════
+#  HTTP-ЭНДПОИНТ ДЛЯ ВЕБХУКА ТИЛЬДЫ
+# ═══════════════════════════════════════════════════════════
+def _extract_payment(data: dict) -> tuple[str, str, str]:
+    """Достаёт email, телефон и сумму из payload Тильды.
+    Тильда шлёт поля формы плоско (Name/Email/Phone), а данные оплаты —
+    в поле `payment` (JSON-строка с amount/orderid/products)."""
+    email = (data.get("email") or data.get("Email") or data.get("E-mail") or "").strip().lower()
+    phone = str(data.get("phone") or data.get("Phone") or data.get("tel") or "").strip()
+    amount = str(data.get("amount") or data.get("payment_amount") or "")
+
+    pay = data.get("payment")
+    if pay:
+        try:
+            pay_obj = pay if isinstance(pay, dict) else json.loads(pay)
+            amount = str(pay_obj.get("amount") or amount)
+            if not email:
+                email = (pay_obj.get("email") or "").strip().lower()
+            if not phone:
+                phone = str(pay_obj.get("phone") or "").strip()
+        except (ValueError, TypeError):
+            pass
+
+    if not amount:
+        amount = str(WORKSHOP_PRICE)
+    return email, phone, amount
+
+async def handle_tilda_webhook(request: web.Request) -> web.Response:
+    app = request.app["bot_app"]
+    bot = app.bot
+
+    # Проверка секрета (из query ?secret=... или заголовка)
+    secret = request.query.get("secret") or request.headers.get("X-Tilda-Secret", "")
+    if TILDA_WEBHOOK_SECRET and secret != TILDA_WEBHOOK_SECRET:
+        logging.warning("Tilda webhook: неверный секрет")
+        return web.Response(status=403, text="forbidden")
+
+    # Парсим тело: form-urlencoded (по умолчанию у Тильды) или JSON
+    data: dict = {}
+    try:
+        if "application/json" in (request.content_type or ""):
+            data = await request.json()
+        else:
+            data = dict(await request.post())
+    except Exception as e:
+        logging.error(f"Tilda webhook parse error: {e}")
+
+    # Тестовый пинг Тильды при сохранении вебхука
+    if not data or "test" in data:
+        return web.Response(text="ok")
+
+    email, phone, amount = _extract_payment(data)
+    logging.info(f"Tilda webhook: email={email}, phone={phone}, amount={amount}")
+
+    if not email and not phone:
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=aid,
+                    text=f"⚠️ Пришла оплата с Тильды без email и телефона — выдайте доступ вручную.\n\n`{data}`"[:4000],
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return web.Response(text="ok")
+
+    rec = db_find_by_contact(email, phone)
+    if not rec:
+        # Человек оплатил на сайте раньше, чем зарегистрировался в боте.
+        # Сохраняем оплату — доступ выдастся автоматически при регистрации.
+        db_add_pending(email, phone, amount)
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=aid,
+                    text=(f"💸 Оплата с сайта ({amount} ₽), но участник ещё не в боте.\n"
+                          f"📧 {email or '—'}  📱 {phone or '—'}\n"
+                          f"Оплата сохранена — доступ выдастся автоматически, когда человек "
+                          f"зарегистрируется в боте с тем же email/телефоном."),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return web.Response(text="ok")
+
+    # Участник найден → подтверждаем и выдаём доступ
+    db_confirm(rec["user_id"], amount)
+    try:
+        await grant_access(bot, rec, amount)
+    except Exception as e:
+        logging.error(f"grant_access error: {e}")
+
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=aid,
+                text=(f"✅ Авто-подтверждение оплаты с Тильды\n"
+                      f"👤 {rec.get('full_name')}\n📧 {email or '—'}  📱 {phone or '—'}\n💰 {amount} ₽\n"
+                      f"🆔 `{rec['user_id']}` — доступ выдан."),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    return web.Response(text="ok")
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.Response(text="bot ok")
+
+# ═══════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════
-def main():
-    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-    init_db()
-
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
     reg_conv = ConversationHandler(
@@ -1016,8 +1308,47 @@ def main():
     app.add_handler(MessageHandler(
         filters.Regex(r"^/reply_\d+") & filters.ChatType.PRIVATE, cmd_reply))
 
-    print("🌸 Бот запущен! База данных: bot.db")
-    app.run_polling(drop_pending_updates=True)
+    return app
+
+def make_web_app(bot_app: Application) -> web.Application:
+    web_app = web.Application()
+    web_app["bot_app"] = bot_app
+    web_app.router.add_post("/tilda-webhook", handle_tilda_webhook)
+    web_app.router.add_get("/tilda-webhook", handle_tilda_webhook)   # для теста Тильды
+    web_app.router.add_get("/", handle_health)                       # health-check Railway
+    return web_app
+
+async def run():
+    init_db()
+    app = build_app()
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    runner = web.AppRunner(make_web_app(app))
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    print(f"🌸 Бот запущен (polling) + HTTP-сервер на :{PORT}")
+    print(f"   Вебхук Тильды: POST /tilda-webhook  | БД: {DB_PATH}")
+
+    stop = asyncio.Event()
+    try:
+        await stop.wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+def main():
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+    try:
+        asyncio.run(run())
+    except (KeyboardInterrupt, SystemExit):
+        print("Остановлено.")
 
 if __name__ == "__main__":
     main()
