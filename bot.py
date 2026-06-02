@@ -10,7 +10,7 @@ import io
 import os
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 from aiohttp import web
@@ -540,7 +540,7 @@ def is_paid_user(user_id: int) -> bool:
     rec = db_get(user_id)
     return bool(rec and rec.get("status") == "Оплачено")
 
-async def send_channel_invite(bot, user_id: int, full_name: str):
+async def send_channel_invite(bot, user_id: int, full_name: str) -> bool:
     """Отправляет персональную ссылку в закрытый канал.
     Ссылка создаётся как join-request: бот одобрит только оплаченных."""
     if not WORKSHOP_CHANNEL_ID:
@@ -548,21 +548,41 @@ async def send_channel_invite(bot, user_id: int, full_name: str):
             chat_id=user_id,
             text="⚠️ Канал пока не настроен. Напишите в поддержку, мы пришлём доступ вручную."
         )
-        return
-    invite = await bot.create_chat_invite_link(
-        chat_id=WORKSHOP_CHANNEL_ID,
-        creates_join_request=True,
-        expire_date=datetime.now() + timedelta(days=7),
-        name=f"{full_name[:28]}",
-    )
-    await bot.send_message(
-        chat_id=user_id,
-        text=("🔗 *Ваша ссылка в закрытый канал воркшопа:*\n\n"
-              f"{invite.invite_link}\n\n"
-              "После перехода нажмите «Join». Бот автоматически одобрит доступ, "
-              "если оплата подтверждена."),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        return False
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=WORKSHOP_CHANNEL_ID,
+            creates_join_request=True,
+            expire_date=datetime.now(timezone.utc) + timedelta(days=7),
+            name=f"{full_name[:28]}",
+        )
+        await bot.send_message(
+            chat_id=user_id,
+            text=("🔗 *Ваша ссылка в закрытый канал воркшопа:*\n\n"
+                  f"{invite.invite_link}\n\n"
+                  "После перехода нажмите «Join». Бот автоматически одобрит доступ, "
+                  "если оплата подтверждена."),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+    except Exception as e:
+        logging.error(f"send_channel_invite error for {user_id}: {e}")
+        await bot.send_message(
+            chat_id=user_id,
+            text=("⚠️ Не удалось создать ссылку в канал автоматически.\n"
+                  "Напишите в поддержку, мы выдадим доступ вручную."),
+        )
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=aid,
+                    text=(f"⚠️ Ошибка выдачи ссылки в канал: {e}\n"
+                          f"user_id `{user_id}`, ФИО: {full_name}"),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return False
 
 async def has_channel_access(bot, user_id: int) -> bool:
     """Проверяет, состоит ли пользователь в закрытом канале воркшопа."""
@@ -1033,8 +1053,21 @@ async def menu_send_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
-    await send_channel_invite(ctx.bot, uid, rec.get("full_name") or update.effective_user.full_name or "Участник")
-    await update.message.reply_text("Если ссылка не открылась, нажмите кнопку ещё раз.", reply_markup=main_kb(uid))
+    ok = await send_channel_invite(
+        ctx.bot,
+        uid,
+        rec.get("full_name") or update.effective_user.full_name or "Участник"
+    )
+    if ok:
+        await update.message.reply_text(
+            "Если ссылка не открылась, нажмите кнопку ещё раз.",
+            reply_markup=main_kb(uid)
+        )
+    else:
+        await update.message.reply_text(
+            "Проверьте сообщения выше. Если ссылка не пришла — нажмите «💬 Поддержка».",
+            reply_markup=main_kb(uid)
+        )
 
 async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Одобряет заявку в канал только для оплаченных пользователей."""
@@ -1101,13 +1134,11 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_confirm(user_id, amount)
     rec = db_get(user_id)
     full_name = rec["full_name"] if rec else "Участник"
-
-    confirm_msg = T_PAYMENT_CONFIRMED.format(
-        full_name=full_name, date=WORKSHOP_DATE_STR
-    )
+    if not rec:
+        rec = {"user_id": user_id, "full_name": full_name}
     try:
-        await ctx.bot.send_message(chat_id=user_id, text=confirm_msg, parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text(f"✅ Подтверждено. Сообщение отправлено — {full_name}.")
+        await grant_access(ctx.bot, rec, amount)
+        await update.message.reply_text(f"✅ Подтверждено. Сообщение и ссылка отправлены — {full_name}.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Не удалось отправить сообщение: {e}")
 
@@ -1284,20 +1315,7 @@ async def grant_access(bot, rec: dict, amount: str):
     )
 
     # 2. Персональная ссылка-приглашение в закрытый канал
-    try:
-        await send_channel_invite(bot, user_id, full_name)
-    except Exception as e:
-        logging.error(f"Invite link error for {user_id}: {e}")
-        for aid in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    chat_id=aid,
-                    text=(f"⚠️ Оплата {full_name} подтверждена, но не удалось создать "
-                          f"ссылку в канал: {e}\nВыдайте доступ вручную (user_id `{user_id}`)."),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception:
-                pass
+    await send_channel_invite(bot, user_id, full_name)
 
 # ═══════════════════════════════════════════════════════════
 #  HTTP-ЭНДПОИНТ ДЛЯ ВЕБХУКА ТИЛЬДЫ
