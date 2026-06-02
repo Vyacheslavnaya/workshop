@@ -49,8 +49,9 @@ ADMIN_IDS          = _env_admin_ids("ADMIN_IDS", [334618540])
 
 WORKSHOP_DATE_STR  = os.getenv("WORKSHOP_DATE_STR", "07 июня 2025")   # дата для показа
 WORKSHOP_DATETIME  = datetime(2025, 7, 15, 10, 0)
-WORKSHOP_PRICE     = int(os.getenv("WORKSHOP_PRICE", "10000"))
+WORKSHOP_PRICE     = int(os.getenv("WORKSHOP_PRICE", "10"))
 WORKSHOP_LOCATION  = os.getenv("WORKSHOP_LOCATION", "Ссылка появится за день до воркшопа")
+PAYMENT_PAGE_URL   = os.getenv("PAYMENT_PAGE_URL", "https://dr.pshinnik.ru/workshop_1")
 
 QR_IMAGE_PATH      = os.getenv("QR_IMAGE_PATH", "qr_sbp.png")
 DB_PATH            = os.getenv("DB_PATH", "bot.db")
@@ -137,9 +138,14 @@ def db_add(data: dict) -> bool:
     try:
         with db() as conn:
             conn.execute("""
-                INSERT OR IGNORE INTO participants
+                INSERT INTO participants
                 (user_id, username, full_name, phone, email, reg_date)
                 VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    full_name=excluded.full_name,
+                    phone=excluded.phone,
+                    email=excluded.email
             """, (
                 data["user_id"], data.get("username", ""),
                 data["full_name"], data["phone"], data["email"],
@@ -353,9 +359,9 @@ T_PAYMENT = """
 
 Стоимость: *{price} ₽*
 
-Отсканируйте QR-код для оплаты через СБП — подходит любой российский банк.
+Оплатите участие на сайте по кнопке ниже.
 
-После оплаты нажмите *«✅ Я оплатила»* и пришлите скриншот из банка.
+После успешной оплаты бот автоматически подтвердит платёж и пришлёт персональную ссылку в закрытый Telegram-канал.
 """.strip()
 
 T_SCREENSHOT = "📸 *Пришлите скриншот оплаты*\n\nСделайте скриншот успешного платежа и отправьте сюда.\n\n_На скриншоте должны быть видны: сумма, дата и статус «Успешно»_"
@@ -674,18 +680,20 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                                    name=f"reminder_{data['user_id']}")
         return ConversationHandler.END
 
-    kb = [[InlineKeyboardButton("✅ Я оплатила", callback_data="payment_done")]]
+    # Регистрируем участника сразу, чтобы вебхук с сайта мог сматчить оплату
+    db_add({"user_id": data["user_id"], "username": data.get("username", ""),
+            "full_name": data["full_name"], "phone": data["phone"], "email": email})
+
+    kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
     await update.message.reply_text(
         T_PAYMENT.format(price=WORKSHOP_PRICE),
         parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
     )
-    try:
-        with open(QR_IMAGE_PATH, "rb") as f:
-            await update.message.reply_photo(photo=f,
-                caption=f"📲 QR-код СБП для оплаты {WORKSHOP_PRICE} ₽")
-    except FileNotFoundError:
-        await update.message.reply_text("⚠️ QR-код не найден — свяжитесь с организатором.")
-    return S_PAYMENT
+    await update.message.reply_text(
+        "После оплаты вернитесь в бот — подтверждение и доступ придут автоматически.",
+        reply_markup=main_kb()
+    )
+    return ConversationHandler.END
 
 async def cb_payment_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
@@ -830,7 +838,7 @@ async def menu_privacy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
 async def menu_resend_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Кнопка «💳 Повторить оплату» — отправить QR ещё раз."""
+    """Кнопка «💳 Повторить оплату» — отправить ссылку на оплату на сайте."""
     rec = db_get(update.effective_user.id)
     if not rec:
         await update.message.reply_text(
@@ -840,21 +848,14 @@ async def menu_resend_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ Ваша оплата уже подтверждена! Ничего делать не нужно.",
             reply_markup=main_kb()); return
-    kb = [
-        [InlineKeyboardButton("✅ Я оплатила", callback_data="payment_done")],
-        [InlineKeyboardButton("💬 Написать в поддержку", callback_data="go_support")],
-    ]
+    kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
     await update.message.reply_text(
         T_PAYMENT.format(price=WORKSHOP_PRICE),
         parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
     )
-    try:
-        with open(QR_IMAGE_PATH, "rb") as f:
-            await update.message.reply_photo(
-                photo=f, caption=f"📲 QR-код СБП для оплаты {WORKSHOP_PRICE} ₽"
-            )
-    except FileNotFoundError:
-        await update.message.reply_text("⚠️ QR-код не найден — свяжитесь с организатором.")
+    await update.message.reply_text(
+        "После оплаты подтверждение и доступ в канал придут автоматически."
+    )
 
 async def menu_edit_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Кнопка «✏️ Изменить данные» — ввести данные заново без повторного согласия."""
