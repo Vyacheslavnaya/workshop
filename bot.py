@@ -372,7 +372,7 @@ T_SUCCESS = """
 Спасибо, {first_name}! 🌸
 
 Скриншот оплаты получен и передан Елене Борисовне на проверку.
-После подтверждения вы получите чек об оплате.
+После подтверждения вы получите доступ в закрытый Telegram-канал.
 
 📋 *Ваши данные:*
 👤 {full_name}
@@ -411,25 +411,6 @@ T_ADMIN_NEW = """
 
 ✅ Подтвердить оплату:
 `/confirm_{user_id}_{price}`
-""".strip()
-
-T_RECEIPT = """
-🧾 *ЧЕК ОБ ОПЛАТЕ*
-━━━━━━━━━━━━━━━━━━━━
-ИП {ip_fio}
-ИНН: {ip_inn} | ОГРНИП: {ip_ogrnip}
-
-📌 Услуга: участие в онлайн-воркшопе
-«Большой день женского здоровья»
-
-👤 {full_name}
-📅 Дата воркшопа: {workshop_date}
-💰 Сумма: {amount} ₽
-📆 Дата оплаты: {pay_date}
-
-✅ *Оплачено*
-━━━━━━━━━━━━━━━━━━━━
-_Сохраните чек_
 """.strip()
 
 T_REMINDER = """
@@ -494,7 +475,7 @@ T_PRIVACY_FULL = """
 *2. ЦЕЛИ ОБРАБОТКИ*
 — Идентификация участника при регистрации
 — Направление информации о воркшопе
-— Отправка чека об оплате
+— Подтверждение оплаты и выдача доступа
 — Направление напоминаний и организационных сообщений
 
 *3. ОБРАБАТЫВАЕМЫЕ ДАННЫЕ*
@@ -524,14 +505,16 @@ T_PRIVACY_FULL = """
 # ═══════════════════════════════════════════════════════════
 def is_admin(uid): return uid in ADMIN_IDS
 
-def main_kb():
-    return ReplyKeyboardMarkup(
-        [["📋 Моя регистрация", "💬 Поддержка"],
-         ["💳 Повторить оплату", "✏️ Изменить данные"],
-         ["📞 Связаться с организатором"],
-         ["📄 Оферта", "🔒 Политика данных"]],
-        resize_keyboard=True
-    )
+def main_kb(user_id: int | None = None):
+    """Главное меню: для оплативших скрываем оплату, для неоплативших показываем."""
+    rec = db_get(user_id) if user_id else None
+    is_paid = rec and rec.get("status") == "Оплачено"
+    rows = [["📋 Моя регистрация", "💬 Поддержка"]]
+    if not is_paid:
+        rows.append(["💳 Повторить оплату", "🔄 Проверить оплату"])
+    rows.append(["✏️ Изменить данные", "📞 Связаться с организатором"])
+    rows.append(["📄 Оферта", "🔒 Политика данных"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 # ═══════════════════════════════════════════════════════════
 #  /start
@@ -540,6 +523,29 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     arg = ctx.args[0] if ctx.args else ""
     if arg == "offer":   return await _send_offer(update)
     if arg == "privacy": return await _send_privacy(update)
+    # Если пользователь уже зарегистрирован — не запускаем анкету заново.
+    rec = db_get(update.effective_user.id)
+    if rec:
+        if rec["status"] == "Оплачено":
+            await update.message.reply_text(
+                f"🌸 Вы уже зарегистрированы и оплата подтверждена.\n\n"
+                f"📅 Воркшоп: {WORKSHOP_DATE_STR}\n"
+                f"👤 {rec['full_name']}",
+                reply_markup=main_kb(update.effective_user.id)
+            )
+        else:
+            kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
+            await update.message.reply_text(
+                f"Вы уже зарегистрированы, но оплата пока не подтверждена.\n\n"
+                f"💰 Стоимость: {WORKSHOP_PRICE} ₽\n"
+                f"Нажмите кнопку, чтобы перейти к оплате:",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            await update.message.reply_text(
+                "После оплаты нажмите «🔄 Проверить оплату» в меню.",
+                reply_markup=main_kb(update.effective_user.id)
+            )
+        return ConversationHandler.END
     ctx.user_data.clear()
     kb = [[InlineKeyboardButton("📄 Ознакомиться с документами →", callback_data="show_docs")]]
     await update.message.reply_text(
@@ -656,7 +662,7 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         rec = db_get(data["user_id"])
         await update.message.reply_text(
             "✅ *Мы нашли вашу оплату на сайте!*\nОткрываю доступ 🌸",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb()
+            parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(data["user_id"])
         )
         try:
             await grant_access(ctx.bot, rec, amount)
@@ -691,7 +697,7 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     await update.message.reply_text(
         "После оплаты вернитесь в бот — подтверждение и доступ придут автоматически.",
-        reply_markup=main_kb()
+        reply_markup=main_kb(data["user_id"])
     )
     return ConversationHandler.END
 
@@ -719,7 +725,7 @@ async def rx_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         T_SUCCESS.format(first_name=first, full_name=data["full_name"],
                          phone=data["phone"], email=data["email"], date=WORKSHOP_DATE_STR),
-        parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb()
+        parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(user.id)
     )
 
     # Уведомляем администратора
@@ -790,7 +796,7 @@ async def rx_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception as e:
             logging.error(f"Support fwd {aid}: {e}")
     await update.message.reply_text("✅ Вопрос отправлен! Отвечу в ближайшее время 🙏",
-                                    reply_markup=main_kb())
+                                    reply_markup=main_kb(update.effective_user.id))
     return ConversationHandler.END
 
 async def cb_support_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -806,13 +812,13 @@ async def menu_my_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rec:
         await update.message.reply_text(
             "Вы ещё не зарегистрированы.\nНажмите /start чтобы начать.",
-            reply_markup=main_kb()); return
+            reply_markup=main_kb(update.effective_user.id)); return
     e = "✅" if rec["status"] == "Оплачено" else "⏳"
     await update.message.reply_text(
         f"📋 *Ваша регистрация*\n\n"
         f"👤 {rec['full_name']}\n📱 {rec['phone']}\n📧 {rec['email']}\n\n"
         f"{e} Статус: *{rec['status']}*\n📅 {WORKSHOP_DATE_STR}",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb()
+        parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(update.effective_user.id)
     )
 
 async def menu_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -823,7 +829,7 @@ async def menu_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👉 @whatshappened\n\n"
         "_Или нажмите кнопку «💬 Поддержка» — ваш вопрос придёт организатору прямо в бот._",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_kb()
+        reply_markup=main_kb(update.effective_user.id)
     )
 
 async def menu_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -843,11 +849,11 @@ async def menu_resend_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rec:
         await update.message.reply_text(
             "Вы ещё не зарегистрированы. Нажмите /start чтобы начать.",
-            reply_markup=main_kb()); return
+            reply_markup=main_kb(update.effective_user.id)); return
     if rec["status"] == "Оплачено":
         await update.message.reply_text(
             "✅ Ваша оплата уже подтверждена! Ничего делать не нужно.",
-            reply_markup=main_kb()); return
+            reply_markup=main_kb(update.effective_user.id)); return
     kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
     await update.message.reply_text(
         T_PAYMENT.format(price=WORKSHOP_PRICE),
@@ -878,8 +884,33 @@ async def menu_edit_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     else:
         await update.message.reply_text(
             "Вы ещё не зарегистрированы. Нажмите /start чтобы начать.",
-            reply_markup=main_kb())
+            reply_markup=main_kb(update.effective_user.id))
         return ConversationHandler.END
+
+async def menu_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🔄 Проверить оплату» — не требует повторной регистрации."""
+    uid = update.effective_user.id
+    rec = db_get(uid)
+    if not rec:
+        await update.message.reply_text(
+            "Вы ещё не зарегистрированы. Нажмите /start, заполните данные и оплатите на сайте.",
+            reply_markup=main_kb(uid),
+        )
+        return
+
+    if rec["status"] == "Оплачено":
+        await update.message.reply_text(
+            "✅ Оплата уже подтверждена. Доступ к воркшопу открыт.",
+            reply_markup=main_kb(uid),
+        )
+        return
+
+    kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
+    await update.message.reply_text(
+        "⏳ Пока не вижу подтверждения оплаты.\n"
+        "Если вы только что оплатили, подождите 10-30 секунд и нажмите «🔄 Проверить оплату» ещё раз.",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
 
 async def cb_go_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     """Кнопка поддержки из меню оплаты."""
@@ -909,15 +940,9 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     confirm_msg = T_PAYMENT_CONFIRMED.format(
         full_name=full_name, date=WORKSHOP_DATE_STR
     )
-    receipt = T_RECEIPT.format(
-        ip_fio=IP_FIO, ip_inn=IP_INN, ip_ogrnip=IP_OGRNIP,
-        full_name=full_name, workshop_date=WORKSHOP_DATE_STR,
-        amount=amount, pay_date=datetime.now().strftime("%d.%m.%Y %H:%M")
-    )
     try:
         await ctx.bot.send_message(chat_id=user_id, text=confirm_msg, parse_mode=ParseMode.MARKDOWN)
-        await ctx.bot.send_message(chat_id=user_id, text=receipt, parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text(f"✅ Подтверждено. Сообщение и чек отправлены — {full_name}.")
+        await update.message.reply_text(f"✅ Подтверждено. Сообщение отправлено — {full_name}.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Не удалось отправить сообщение: {e}")
 
@@ -1010,7 +1035,7 @@ async def cmd_admin_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/export — скачать Excel\n"
         "/stats — статистика\n"
         "/broadcast — рассылка сообщения\n"
-        "/confirm\\_ID\\_СУММА — подтвердить оплату + отправить чек\n"
+        "/confirm\\_ID\\_СУММА — подтвердить оплату\n"
         "/reply\\_ID текст — ответить участнице\n\n"
         "_Примеры:_\n"
         "`/confirm_123456789_10000`\n"
@@ -1082,7 +1107,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ═══════════════════════════════════════════════════════════
 async def grant_access(bot, rec: dict, amount: str):
     """Подтверждает оплату участнику и выдаёт доступ:
-    сообщение-подтверждение + чек + персональная одноразовая ссылка в канал."""
+    сообщение-подтверждение + персональная одноразовая ссылка в канал."""
     user_id   = rec["user_id"]
     full_name = rec.get("full_name") or "Участник"
 
@@ -1093,15 +1118,7 @@ async def grant_access(bot, rec: dict, amount: str):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # 2. Чек
-    receipt = T_RECEIPT.format(
-        ip_fio=IP_FIO, ip_inn=IP_INN, ip_ogrnip=IP_OGRNIP,
-        full_name=full_name, workshop_date=WORKSHOP_DATE_STR,
-        amount=amount, pay_date=datetime.now().strftime("%d.%m.%Y %H:%M"),
-    )
-    await bot.send_message(chat_id=user_id, text=receipt, parse_mode=ParseMode.MARKDOWN)
-
-    # 3. Персональная одноразовая ссылка-приглашение в закрытый канал
+    # 2. Персональная одноразовая ссылка-приглашение в закрытый канал
     if WORKSHOP_CHANNEL_ID:
         try:
             invite = await bot.create_chat_invite_link(
@@ -1313,6 +1330,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex("^📋 Моя регистрация$"), menu_my_reg))
     app.add_handler(MessageHandler(filters.Regex("^📞 Связаться с организатором$"), menu_contact))
     app.add_handler(MessageHandler(filters.Regex("^💳 Повторить оплату$"), menu_resend_qr))
+    app.add_handler(MessageHandler(filters.Regex("^🔄 Проверить оплату$"), menu_check_payment))
     app.add_handler(MessageHandler(filters.Regex("^📄 Оферта$"),          menu_offer))
     app.add_handler(MessageHandler(filters.Regex("^🔒 Политика данных$"), menu_privacy))
     app.add_handler(CallbackQueryHandler(cb_go_support, pattern="^go_support$"))
