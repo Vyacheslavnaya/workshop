@@ -10,6 +10,8 @@ import io
 import os
 import json
 import sqlite3
+import re
+import math
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
@@ -112,20 +114,80 @@ def init_db():
                 amount      TEXT DEFAULT '',
                 reg_date    TEXT,
                 pay_date    TEXT DEFAULT '',
+                paid_until  TEXT DEFAULT '',
+                reminded_at TEXT DEFAULT '',
+                sku         TEXT DEFAULT '',
+                order_id    TEXT DEFAULT '',
                 note        TEXT DEFAULT ''
             )
         """)
-        # Оплаты с сайта, для которых ещё нет участника в боте
-        # (человек оплатил раньше, чем зарегистрировался). Матчим по email/телефону.
+        # Миграция: добавляем новые колонки в participants если таблица уже существовала
+        cursor = conn.execute("PRAGMA table_info(participants)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        for col in ("paid_until", "reminded_at", "sku", "order_id"):
+            if col not in existing_cols:
+                try:
+                    conn.execute(f"ALTER TABLE participants ADD COLUMN {col} TEXT DEFAULT ''")
+                except Exception as e:
+                    logging.warning(f"Could not add column {col} to participants: {e}")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_payments (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 email     TEXT DEFAULT '',
                 phone     TEXT DEFAULT '',
                 amount    TEXT DEFAULT '',
+                days      INTEGER DEFAULT 30,
+                sku       TEXT DEFAULT '',
+                order_id  TEXT DEFAULT '',
                 created   TEXT
             )
         """)
+        # Миграция: добавляем новые колонки в pending_payments
+        p_cursor = conn.execute("PRAGMA table_info(pending_payments)")
+        existing_p_cols = {row["name"] for row in p_cursor.fetchall()}
+        for col in ("days", "sku", "order_id"):
+            if col not in existing_p_cols:
+                try:
+                    col_type = "INTEGER DEFAULT 30" if col == "days" else "TEXT DEFAULT ''"
+                    conn.execute(f"ALTER TABLE pending_payments ADD COLUMN {col} {col_type}")
+                except Exception as e:
+                    logging.warning(f"Could not add column {col} to pending_payments: {e}")
+
+def parse_dt(s: str) -> datetime | None:
+    """Безопасный парсинг даты из строки разных форматов."""
+    if not s:
+        return None
+    raw = str(s).strip()
+    # Отсекаем микросекунды только в конце времени (например, 2026-10-14T12:00:00.123456 -> 2026-10-14T12:00:00)
+    cleaned = re.sub(r'(\d{2}:\d{2}:\d{2})\.\d+', r'\1', raw).rstrip('Z')
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d.%m.%Y"
+    ):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            pass
+    return None
+
+def is_subscription_active(rec: dict | None) -> bool:
+    """Проверяет, активна ли подписка/доступ пользователя."""
+    if not rec or rec.get("status") != "Оплачено":
+        return False
+    paid_until_str = rec.get("paid_until")
+    if not paid_until_str:
+        # Если дата окончания не задана, но статус Оплачено (бессрочный доступ воркшопа)
+        return True
+    dt = parse_dt(paid_until_str)
+    if not dt:
+        return True
+    return dt > datetime.now()
 
 def norm_phone(raw) -> str:
     """Приводит телефон к каноническому виду 7XXXXXXXXXX для сравнения."""
@@ -174,6 +236,43 @@ def db_confirm(user_id: int, amount: str) -> bool:
     except Exception as e:
         logging.error(f"DB confirm error: {e}"); return False
 
+def db_extend_subscription(user_id: int, days: int = 30, amount: str = "", sku: str = "", order_id: str = "") -> str:
+    """Продлевает подписку пользователя на days дней.
+    Если текущая подписка ещё действует — продлевает от текущего paid_until, иначе от текущего момента.
+    Возвращает строку с датой окончания в формате ДД.ММ.ГГГГ."""
+    rec = db_get(user_id)
+    now = datetime.now()
+    base_dt = now
+    if rec and rec.get("paid_until"):
+        current_until = parse_dt(rec["paid_until"])
+        if current_until and current_until > now:
+            base_dt = current_until
+
+    new_until = base_dt + timedelta(days=days)
+    new_until_str = new_until.strftime("%Y-%m-%d %H:%M:%S")
+    display_date = new_until.strftime("%d.%m.%Y")
+
+    with db() as conn:
+        conn.execute("""
+            UPDATE participants
+            SET status='Оплачено',
+                amount=CASE WHEN ? != '' THEN ? ELSE amount END,
+                pay_date=?,
+                paid_until=?,
+                sku=CASE WHEN ? != '' THEN ? ELSE sku END,
+                order_id=CASE WHEN ? != '' THEN ? ELSE order_id END,
+                reminded_at=''
+            WHERE user_id=?
+        """, (
+            str(amount), str(amount),
+            now.strftime("%d.%m.%Y %H:%M"),
+            new_until_str,
+            str(sku), str(sku),
+            str(order_id), str(order_id),
+            user_id
+        ))
+    return display_date
+
 def db_all() -> list:
     with db() as conn:
         rows = conn.execute("SELECT * FROM participants ORDER BY id").fetchall()
@@ -185,8 +284,6 @@ def db_get(user_id: int) -> dict | None:
         return dict(row) if row else None
 
 def db_get_by_email(email: str) -> dict | None:
-    """Поиск участника по email (без учёта регистра) — для матчинга оплаты с Тильды.
-    Берём самую свежую запись на случай нескольких регистраций с одним email."""
     if not email:
         return None
     with db() as conn:
@@ -197,7 +294,6 @@ def db_get_by_email(email: str) -> dict | None:
         return dict(row) if row else None
 
 def db_find_by_contact(email: str, phone: str) -> dict | None:
-    """Ищет участника по email ИЛИ по нормализованному телефону."""
     rec = db_get_by_email(email) if email else None
     if rec:
         return rec
@@ -214,8 +310,8 @@ def db_find_by_contact(email: str, phone: str) -> dict | None:
                 return dict(r)
     return None
 
-def db_add_pending(email: str, phone: str, amount: str):
-    """Сохраняет оплату с сайта, под которую ещё нет участника в боте.
+def db_add_pending(email: str, phone: str, amount: str, days: int = 30, sku: str = "", order_id: str = ""):
+    """Сохраняет оплату с сайта/Gupil, под которую ещё нет участника в боте.
     Дедуп: повторные вебхуки по тому же email/телефону не плодят строки."""
     e = (email or "").strip().lower()
     p = norm_phone(phone)
@@ -225,13 +321,12 @@ def db_add_pending(email: str, phone: str, amount: str):
         if p:
             conn.execute("DELETE FROM pending_payments WHERE phone=?", (p,))
         conn.execute(
-            "INSERT INTO pending_payments (email, phone, amount, created) VALUES (?, ?, ?, ?)",
-            (e, p, str(amount), datetime.now().strftime("%d.%m.%Y %H:%M"))
+            "INSERT INTO pending_payments (email, phone, amount, days, sku, order_id, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (e, p, str(amount), days, str(sku), str(order_id), datetime.now().strftime("%d.%m.%Y %H:%M"))
         )
 
 def db_pop_pending(email: str, phone: str) -> dict | None:
-    """Находит ожидающую оплату по email/телефону, удаляет её и возвращает.
-    Вызывается, когда человек регистрируется в боте после оплаты на сайте."""
+    """Находит ожидающую оплату по email/телефону, удаляет её и возвращает."""
     e = (email or "").strip().lower()
     p = norm_phone(phone)
     p10 = phone_tail10(phone)
@@ -539,7 +634,7 @@ def main_kb(user_id: int | None = None):
 
 def is_paid_user(user_id: int) -> bool:
     rec = db_get(user_id)
-    return bool(rec and rec.get("status") == "Оплачено")
+    return is_subscription_active(rec)
 
 def _invite_error_hint(err_msg: str) -> str:
     low = err_msg.lower()
@@ -834,10 +929,13 @@ async def rx_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         db_add({"user_id": data["user_id"], "username": data.get("username", ""),
                 "full_name": data["full_name"], "phone": data["phone"], "email": email})
         amount = pend.get("amount") or str(WORKSHOP_PRICE)
-        db_confirm(data["user_id"], amount)
+        days = int(pend.get("days") or 30)
+        sku = pend.get("sku") or ""
+        order_id = pend.get("order_id") or ""
+        display_date = db_extend_subscription(data["user_id"], days=days, amount=amount, sku=sku, order_id=order_id)
         rec = db_get(data["user_id"])
         await update.message.reply_text(
-            "✅ *Мы нашли вашу оплату на сайте!*\nОткрываю доступ 🌸",
+            f"✅ *Мы нашли вашу оплату на сайте!*\nДоступ к клубу и Дневнику открыт до *{display_date}* 🌸",
             parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(data["user_id"])
         )
         try:
@@ -989,11 +1087,16 @@ async def menu_my_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Вы ещё не зарегистрированы.\nНажмите /start чтобы начать.",
             reply_markup=main_kb(update.effective_user.id)); return
-    e = "✅" if rec["status"] == "Оплачено" else "⏳"
+    e = "✅" if is_subscription_active(rec) else "⏳"
+    sub_info = ""
+    if rec.get("paid_until"):
+        p_dt = parse_dt(rec["paid_until"])
+        if p_dt:
+            sub_info = f"\n⏳ Подписка до: *{p_dt.strftime('%d.%m.%Y %H:%M')}*"
     await update.message.reply_text(
         f"📋 *Ваша регистрация*\n\n"
         f"👤 {rec['full_name']}\n📱 {rec['phone']}\n📧 {rec['email']}\n\n"
-        f"{e} Статус: *{rec['status']}*\n📅 {WORKSHOP_DATE_STR}",
+        f"{e} Статус: *{rec['status']}*{sub_info}\n📅 {WORKSHOP_DATE_STR}",
         parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(update.effective_user.id)
     )
 
@@ -1026,9 +1129,9 @@ async def menu_resend_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Вы ещё не зарегистрированы. Нажмите /start чтобы начать.",
             reply_markup=main_kb(update.effective_user.id)); return
-    if rec["status"] == "Оплачено":
+    if is_subscription_active(rec):
         await update.message.reply_text(
-            "✅ Ваша оплата уже подтверждена! Ничего делать не нужно.",
+            "✅ Ваша подписка активна! Ничего делать не нужно.",
             reply_markup=main_kb(update.effective_user.id)); return
     kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
     await update.message.reply_text(
@@ -1074,9 +1177,14 @@ async def menu_check_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if rec["status"] == "Оплачено":
+    if is_subscription_active(rec):
+        sub_info = ""
+        if rec.get("paid_until"):
+            p_dt = parse_dt(rec["paid_until"])
+            if p_dt:
+                sub_info = f" Доступ активен до {p_dt.strftime('%d.%m.%Y %H:%M')}."
         await update.message.reply_text(
-            "✅ Оплата уже подтверждена. Доступ к воркшопу открыт.",
+            f"✅ Оплата подтверждена.{sub_info} Доступ к клубу открыт.",
             reply_markup=main_kb(uid),
         )
         return
@@ -1098,10 +1206,10 @@ async def menu_send_channel_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             reply_markup=main_kb(uid),
         )
         return
-    if rec["status"] != "Оплачено":
-        kb = [[InlineKeyboardButton("💳 Оплатить на сайте", url=PAYMENT_PAGE_URL)]]
+    if not is_subscription_active(rec):
+        kb = [[InlineKeyboardButton("💳 Оплатить доступ", url=PAYMENT_PAGE_URL)]]
         await update.message.reply_text(
-            "Ссылка в канал доступна только после подтверждённой оплаты.",
+            "Ссылка в канал доступна только при активной оплаченной подписке.\nПродлите доступ:",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -1529,8 +1637,26 @@ async def handle_tilda_webhook(request: web.Request) -> web.Response:
         ))
         return web.Response(text="ok")
 
-    # Повторный вебхук Тильды по уже оплаченной заявке — не дублируем выдачу
+    # Повторный вебхук Тильды по уже оплаченной заявке:
     if rec.get("status") == "Оплачено":
+        if rec.get("paid_until"):
+            display_date = db_extend_subscription(rec["user_id"], days=30, amount=amount)
+            _spawn(_notify_admins(
+                bot,
+                (f"🔄 Продление подписки с Тильды\n"
+                 f"👤 {rec.get('full_name')}\n📧 {email or '—'}  📱 {phone or '—'}\n💰 {amount} ₽\n"
+                 f"🆔 `{rec['user_id']}` — продлено до {display_date}.")
+            ))
+            async def _notify_user_extended():
+                try:
+                    await bot.send_message(
+                        chat_id=rec["user_id"],
+                        text=f"🌸 *Подписка успешно продлена!*\n\nДоступ к закрытой группе и Дневнику самочувствия открыт до *{display_date}*.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    pass
+            _spawn(_notify_user_extended())
         return web.Response(text="ok")
 
     # Участник найден → подтверждаем; саму выдачу делаем в фоне, чтобы
@@ -1538,6 +1664,212 @@ async def handle_tilda_webhook(request: web.Request) -> web.Response:
     db_confirm(rec["user_id"], amount)
     _spawn(_grant_and_notify(bot, rec, email, phone, amount))
     return web.Response(text="ok")
+
+def _plural_days(n: int) -> str:
+    if 11 <= (n % 100) <= 14:
+        return f"{n} дней"
+    if n % 10 == 1:
+        return f"{n} день"
+    if 2 <= (n % 10) <= 4:
+        return f"{n} дня"
+    return f"{n} дней"
+
+async def job_check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая проверка подписок:
+    1. Напоминание за 3 дня до окончания.
+    2. Автоматическое исключение из закрытой группы по истечении срока."""
+    now = datetime.now()
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM participants WHERE status='Оплачено' AND paid_until != ''").fetchall()
+        participants = [dict(r) for r in rows]
+
+    for p in participants:
+        paid_until = parse_dt(p.get("paid_until"))
+        if not paid_until:
+            continue
+        uid = p["user_id"]
+        reminded_at = p.get("reminded_at") or ""
+        today_str = now.strftime("%Y-%m-%d")
+
+        # 1. Срок истёк -> исключаем из канала/группы
+        if paid_until <= now:
+            try:
+                kicked = True
+                if WORKSHOP_CHANNEL_ID:
+                    try:
+                        await context.bot.ban_chat_member(chat_id=WORKSHOP_CHANNEL_ID, user_id=uid)
+                        await context.bot.unban_chat_member(chat_id=WORKSHOP_CHANNEL_ID, user_id=uid, only_if_banned=True)
+                    except Exception as e:
+                        logging.warning(f"Failed to kick expired user {uid}: {e}")
+                        kicked = False
+
+                if kicked or not WORKSHOP_CHANNEL_ID:
+                    with db() as conn:
+                        conn.execute("UPDATE participants SET status='Истёк доступ' WHERE user_id=?", (uid,))
+
+                kb = [[InlineKeyboardButton("💳 Продлить доступ", url=PAYMENT_PAGE_URL)]]
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "⏳ *Срок действия подписки завершился.*\n\n"
+                        "Доступ к закрытой группе и Дневнику самочувствия приостановлен.\n"
+                        "Чтобы продолжить участие и сохранить динамику в Дневнике, оформите продление:"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
+                logging.info(f"User {uid} subscription expired and kicked from channel")
+            except Exception as e:
+                logging.error(f"Error handling expired user {uid}: {e}")
+            continue
+
+        # 2. Напоминание за 3 дня (осталось <= 3 дней и больше 0)
+        time_left = paid_until - now
+        if timedelta(days=0) < time_left <= timedelta(days=3):
+            if reminded_at != today_str:
+                days_left = max(1, math.ceil(time_left.total_seconds() / 86400))
+                day_str = _plural_days(days_left)
+                kb = [[InlineKeyboardButton("💳 Продлить подписку", url=PAYMENT_PAGE_URL)]]
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"🔔 *Напоминание о подписке*\n\n"
+                            f"До окончания доступа к клубу и Дневнику самочувствия осталось *{day_str}* "
+                            f"(до {paid_until.strftime('%d.%m.%Y %H:%M')}).\n\n"
+                            f"Чтобы не потерять доступ к группе и статистике, продлите подписку заранее:"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup(kb)
+                    )
+                    with db() as conn:
+                        conn.execute("UPDATE participants SET reminded_at=? WHERE user_id=?", (today_str, uid))
+                    logging.info(f"Sent 3-day expiration reminder to user {uid}")
+                except Exception as e:
+                    logging.warning(f"Failed to send expiration reminder to {uid}: {e}")
+
+async def handle_subscription_webhook(request: web.Request) -> web.Response:
+    """Приём вебхука от Gupil о покупке подписки (по SKU)."""
+    app = request.app["bot_app"]
+    bot = app.bot
+
+    # Проверка секрета
+    secret = request.headers.get("X-Webhook-Secret") or request.headers.get("X-Tilda-Secret") or request.query.get("secret") or ""
+    if TILDA_WEBHOOK_SECRET and secret != TILDA_WEBHOOK_SECRET:
+        logging.warning("Subscription webhook: неверный секрет")
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    data = {}
+    try:
+        if "application/json" in (request.content_type or ""):
+            data = await request.json()
+        else:
+            data = dict(await request.post())
+    except Exception as e:
+        logging.error(f"Subscription webhook parse error: {e}")
+        return web.json_response({"error": "malformed_body"}, status=400)
+
+    email = (data.get("email") or "").strip().lower()
+    phone = str(data.get("phone") or "").strip()
+    amount = str(data.get("amount") or "")
+    sku = str(data.get("sku") or "")
+    order_id = str(data.get("order_id") or "")
+    full_name = str(data.get("full_name") or "")
+
+    try:
+        days = int(data.get("subscription_days") or 30)
+        if days <= 0 or days > 3650:
+            days = 30
+    except (ValueError, TypeError):
+        days = 30
+
+    if not email and not phone:
+        return web.json_response({"error": "missing email or phone"}, status=400)
+
+    # Идемпотентность по order_id: если этот заказ уже применялся, возвращаем ok
+    if order_id:
+        with db() as conn:
+            exists = conn.execute("SELECT user_id, paid_until FROM participants WHERE order_id=? AND order_id != ''", (order_id,)).fetchone()
+            if exists:
+                logging.info(f"Duplicate subscription webhook ignored for order_id={order_id}")
+                return web.json_response({"ok": True, "status": "already_processed", "paid_until": exists["paid_until"]})
+
+    logging.info(f"Subscription webhook: email={email}, phone={phone}, days={days}, sku={sku}, order_id={order_id}")
+
+    rec = db_find_by_contact(email, phone)
+    if not rec:
+        db_add_pending(email, phone, amount, days=days, sku=sku, order_id=order_id)
+        _spawn(_notify_admins(
+            bot,
+            f"💸 Оплата подписки на {days} дней ({amount} ₽, SKU: {sku}), но участник ещё не в боте.\n"
+            f"📧 {email or '—'}  📱 {phone or '—'}\n"
+            f"Доступ откроется автоматически при регистрации в боте."
+        ))
+        return web.json_response({"ok": True, "status": "pending_saved"})
+
+    uid = rec["user_id"]
+    display_date = db_extend_subscription(uid, days=days, amount=amount, sku=sku, order_id=order_id)
+    rec = db_get(uid)
+
+    async def _notify_user_sub():
+        try:
+            await bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"🌸 *Подписка успешно продлена!*\n\n"
+                    f"Доступ к закрытой группе и Дневнику самочувствия открыт до *{display_date}*."
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await send_channel_invite(bot, uid, rec.get("full_name") or full_name or "Участник")
+        except Exception as e:
+            logging.error(f"Failed to notify user about subscription extension {uid}: {e}")
+
+    _spawn(_notify_user_sub())
+    _spawn(_notify_admins(
+        bot,
+        f"✅ Подписка продлена на {days} дней (до {display_date})\n"
+        f"👤 {rec.get('full_name')}  📱 {phone or rec.get('phone')}  💰 {amount} ₽\n"
+        f"🆔 `{uid}`"
+    ))
+    return web.json_response({"ok": True, "status": "active", "paid_until": display_date})
+
+async def handle_check_subscription(request: web.Request) -> web.Response:
+    """API-эндпоинт для Telegram Mini App (проверка активности подписки)."""
+    raw_uid = request.query.get("telegram_id") or request.query.get("user_id") or ""
+    if not raw_uid.lstrip("-").isdigit():
+        return web.json_response({"error": "invalid telegram_id"}, status=400, headers={"Access-Control-Allow-Origin": "*"})
+
+    uid = int(raw_uid)
+    rec = db_get(uid)
+    active = is_subscription_active(rec)
+    paid_until = rec.get("paid_until") if rec else ""
+
+    days_left = 0
+    if paid_until:
+        p_dt = parse_dt(paid_until)
+        if p_dt and p_dt > datetime.now():
+            days_left = max(0, math.ceil((p_dt - datetime.now()).total_seconds() / 86400))
+
+    return web.json_response({
+        "telegram_id": uid,
+        "active": active,
+        "status": rec.get("status") if rec else "not_registered",
+        "paid_until": paid_until,
+        "days_left": days_left,
+        "payment_url": PAYMENT_PAGE_URL
+    }, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    })
+
+async def handle_check_subscription_cors(request: web.Request) -> web.Response:
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    })
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="bot ok")
@@ -1630,6 +1962,9 @@ def build_app() -> Application:
 
     app.add_error_handler(on_error)
 
+    if app.job_queue:
+        app.job_queue.run_repeating(job_check_subscriptions, interval=3600, first=20)
+
     return app
 
 def make_web_app(bot_app: Application) -> web.Application:
@@ -1637,6 +1972,9 @@ def make_web_app(bot_app: Application) -> web.Application:
     web_app["bot_app"] = bot_app
     web_app.router.add_post("/tilda-webhook", handle_tilda_webhook)
     web_app.router.add_get("/tilda-webhook", handle_tilda_webhook)   # для теста Тильды
+    web_app.router.add_post("/api/webhook/subscription", handle_subscription_webhook)
+    web_app.router.add_get("/api/check-subscription", handle_check_subscription)
+    web_app.router.add_options("/api/check-subscription", handle_check_subscription_cors)
     web_app.router.add_get("/", handle_health)                       # health-check Railway
     return web_app
 
